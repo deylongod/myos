@@ -1,0 +1,682 @@
+"lib.rs":
+#![no_std]
+#![cfg_attr(test, no_main)]
+#![feature(custom_test_frameworks)]
+#![feature(abi_x86_interrupt)]
+#![test_runner(crate::test_runner)]
+#![reexport_test_harness_main = "test_main"]
+
+extern crate alloc;
+use core::panic::PanicInfo;
+
+pub mod allocator;
+pub mod kernel;
+pub mod task;
+
+pub fn init() {
+    kernel::gdt::init();
+    kernel::interrupts::init_idt();
+}
+
+pub trait Testable {
+    fn run(&self) -> ();
+}
+
+impl<T> Testable for T
+where
+    T: Fn(),
+{
+    fn run(&self) {
+        kernel::vga_buffer::_print(format_args!("{}...\t", core::any::type_name::<T>()));
+
+        self();
+        kernel::vga_buffer::_print(format_args!("[ok]\n"));
+    }
+}
+
+pub fn test_runner(tests: &[&dyn Testable]) {
+    kernel::vga_buffer::_print(format_args!("Running {} tests\n", tests.len()));
+
+    for test in tests {
+        test.run();
+    }
+    exit_qemu(QemuExitCode::Success);
+}
+
+pub fn test_panic_handler(info: &PanicInfo) -> ! {
+    kernel::vga_buffer::_print(format_args!("[failed]\n"));
+    kernel::vga_buffer::_print(format_args!("Error: {}\n", info));
+    exit_qemu(QemuExitCode::Failed);
+    hlt_loop();
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum QemuExitCode {
+    Success = 0x10,
+    Failed = 0x11,
+}
+
+pub fn exit_qemu(exit_code: QemuExitCode) {
+    use x86_64::instructions::port::Port;
+
+    unsafe {
+        let mut port = Port::new(0xf4);
+        port.write(exit_code as u32);
+    }
+}
+
+pub fn hlt_loop() -> ! {
+    loop {
+        x86_64::instructions::hlt();
+    }
+}
+
+#[macro_export]
+macro_rules! print {
+    ($($arg:tt)*) => ($crate::kernel::vga_buffer::_print(format_args!($($arg)*)));
+}
+
+#[macro_export]
+macro_rules! println {
+    ($($arg:tt)*) => ($crate::print!("{}\n", format_args!($($arg)*)));
+}
+
+
+#[cfg(test)]
+use bootloader::{BootInfo, entry_point};
+
+#[cfg(test)]
+entry_point!(test_kernel_main);
+
+#[cfg(test)]
+fn test_kernel_main(_boot_info: &'static BootInfo) -> ! {
+    init();
+    hlt_loop();
+}
+
+#[cfg(test)]
+#[panic_handler]
+fn panic(info: &PanicInfo) -> ! {
+    test_panic_handler(info)
+}
+
+---
+
+"main.rs":
+#![no_std]
+#![no_main]
+#![feature(custom_test_frameworks)]
+#![test_runner(deylon666::test_runner)]
+
+extern crate alloc;
+
+use deylon666::println;
+use deylon666::task::Task;
+use deylon666::task::executor::Executor;
+use bootloader::{BootInfo, entry_point};
+use core::panic::PanicInfo;
+use x86_64::VirtAddr;
+use deylon666::allocator;
+use deylon666::kernel::memory::{self, BootInfoFrameAllocator};
+
+entry_point!(kernel_main);
+
+fn kernel_main(boot_info: &'static BootInfo) -> ! {
+    deylon666::init();
+
+    let phys_mem_offset = VirtAddr::new(boot_info.physical_memory_offset);
+    let mut mapper = unsafe { memory::init(phys_mem_offset) };
+    let mut frame_allocator = unsafe { BootInfoFrameAllocator::init(&boot_info.memory_map) };
+
+    allocator::init_heap(&mut mapper, &mut frame_allocator).expect("heap initialization failed");
+
+    let mut executor = Executor::new();
+    executor.spawn(Task::new(async_task_1()));
+    executor.spawn(Task::new(async_task_2()));
+    executor.spawn(Task::new(example_task()));
+    executor.run();
+}
+
+#[cfg(not(test))]
+#[panic_handler]
+fn panic(info: &PanicInfo) -> ! {
+    println!("{}", info);
+    deylon666::hlt_loop();
+}
+
+#[cfg(test)]
+#[panic_handler]
+fn panic(info: &PanicInfo) -> ! {
+    deylon666::test_panic_handler(info)
+}
+
+async fn async_number() -> u32 {
+    println!("Выполняем асинхронную операцию");
+    42
+}
+
+async fn example_task() {
+    let number = async_number().await;
+    println!("async number: {}", number);
+}
+
+async fn async_task_1() {
+    use deylon666::task::yield_now;
+    for i in 0..5 {
+        println!("Task 1: {}", i);
+        for _ in 0..1000 {
+            yield_now().await;
+        }
+    }
+}
+
+async fn async_task_2() {
+    use deylon666::task::yield_now;
+    for i in 0..5 {
+        println!("Task 2: {}", i);
+        for _ in 0..1000 {
+            yield_now().await;
+        }
+    }
+}
+
+#[test_case]
+fn trivial_assertion() {
+    assert_eq!(1, 1);
+}
+
+---
+
+"/allocator/mod.rs":
+use x86_64::{
+    VirtAddr,
+    structures::paging::{
+        FrameAllocator, Mapper, Page, PageTableFlags, Size4KiB, mapper::MapToError,
+    },
+};
+
+mod bump;
+
+pub use bump::BumpAllocator;
+
+pub const HEAP_START: usize = 0x_4444_4444_0000;
+pub const HEAP_SIZE: usize = 100 * 1024;
+
+pub struct Locked<A> {
+    inner: spin::Mutex<A>,
+}
+
+impl<A> Locked<A> {
+    pub const fn new(inner: A) -> Self {
+        Locked {
+            inner: spin::Mutex::new(inner),
+        }
+    }
+
+    pub fn lock(&self) -> spin::MutexGuard<A> {
+        self.inner.lock()
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: Locked<BumpAllocator> = Locked::new(BumpAllocator::new());
+
+pub fn init_heap(
+    mapper: &mut impl Mapper<Size4KiB>,
+    frame_allocator: &mut impl FrameAllocator<Size4KiB>,
+) -> Result<(), MapToError<Size4KiB>> {
+    let page_range = {
+        let heap_start = VirtAddr::new(HEAP_START as u64);
+        let heap_end = heap_start + HEAP_SIZE - 1u64;
+        let heap_start_page = Page::containing_address(heap_start);
+        let heap_end_page = Page::containing_address(heap_end);
+        Page::range_inclusive(heap_start_page, heap_end_page)
+    };
+
+    for page in page_range {
+        let frame = frame_allocator
+            .allocate_frame()
+            .ok_or(MapToError::FrameAllocationFailed)?;
+        let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+        unsafe { mapper.map_to(page, frame, flags, frame_allocator)?.flush() };
+    }
+
+    unsafe {
+        ALLOCATOR.lock().init(HEAP_START, HEAP_SIZE);
+    }
+
+    Ok(())
+}
+
+fn align_up(addr: usize, align: usize) -> usize {
+    (addr + align - 1) & !(align - 1)
+}
+
+---
+
+"/allocator/bump.rs":
+use super::{Locked, align_up};
+use alloc::alloc::{GlobalAlloc, Layout};
+use core::ptr;
+
+pub struct BumpAllocator {
+    heap_start: usize,
+    heap_end: usize,
+    next: usize,
+    allocations: usize,
+}
+
+impl BumpAllocator {
+    pub const fn new() -> Self {
+        BumpAllocator {
+            heap_start: 0,
+            heap_end: 0,
+            next: 0,
+            allocations: 0,
+        }
+    }
+
+    pub unsafe fn init(&mut self, heap_start: usize, heap_size: usize) {
+        self.heap_start = heap_start;
+        self.heap_end = heap_start.saturating_add(heap_size);
+        self.next = heap_start;
+    }
+}
+
+unsafe impl GlobalAlloc for Locked<BumpAllocator> {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let mut bump = self.lock();
+
+        let alloc_start = align_up(bump.next, layout.align());
+        let alloc_end = match alloc_start.checked_add(layout.size()) {
+            Some(end) => end,
+            None => return ptr::null_mut(),
+        };
+
+        if alloc_end > bump.heap_end {
+            ptr::null_mut()
+        } else {
+            bump.next = alloc_end;
+            bump.allocations += 1;
+            alloc_start as *mut u8
+        }
+    }
+
+    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {
+        let mut bump = self.lock();
+
+        bump.allocations -= 1;
+        if bump.allocations == 0 {
+            bump.next = bump.heap_start;
+        }
+    }
+}
+
+---
+
+"/kernel/mod.rs":
+pub mod gdt;
+pub mod interrupts;
+pub mod memory;
+pub mod vga_buffer;
+
+pub use gdt::init as gdt_init;
+pub use interrupts::init_idt as interrupts_init_idt;
+
+---
+
+"/kernel/gdt.rs":
+use lazy_static::lazy_static;
+use x86_64::VirtAddr;
+use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable, SegmentSelector};
+use x86_64::structures::tss::TaskStateSegment;
+
+pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
+
+lazy_static! {
+    static ref TSS: TaskStateSegment = {
+        let mut tss = TaskStateSegment::new();
+        tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = {
+            const STACK_SIZE: usize = 4096 * 5;
+            static mut STACK: [u8; STACK_SIZE] = [0; STACK_SIZE];
+
+            let stack_start = VirtAddr::from_ptr(&raw const STACK);
+            let stack_end = stack_start + STACK_SIZE;
+            stack_end
+        };
+        tss
+    };
+}
+
+lazy_static! {
+    static ref GDT: (GlobalDescriptorTable, Selectors) = {
+        let mut gdt = GlobalDescriptorTable::new();
+        let code_selector = gdt.add_entry(Descriptor::kernel_code_segment());
+        let tss_selector = gdt.add_entry(Descriptor::tss_segment(&TSS));
+        (
+            gdt,
+            Selectors {
+                code_selector,
+                tss_selector,
+            },
+        )
+    };
+}
+
+struct Selectors {
+    code_selector: SegmentSelector,
+    tss_selector: SegmentSelector,
+}
+
+pub fn init() {
+    use x86_64::instructions::segmentation::{CS, Segment};
+    use x86_64::instructions::tables::load_tss;
+
+    GDT.0.load();
+    unsafe {
+        CS::set_reg(GDT.1.code_selector);
+        load_tss(GDT.1.tss_selector);
+    }
+}
+
+---
+
+"/kernel/interrupts.rs":
+use lazy_static::lazy_static;
+use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame};
+use crate::kernel::gdt;
+
+lazy_static! {
+        static ref IDT: InterruptDescriptorTable = {
+            let mut idt = InterruptDescriptorTable::new();
+            unsafe {
+                idt.double_fault
+                    .set_handler_fn(double_fault_handler)
+                    .set_stack_index(gdt::DOUBLE_FAULT_IST_INDEX);
+            }
+            idt
+        };
+    }
+
+pub fn init_idt() {
+    IDT.load();
+}
+
+extern "x86-interrupt" fn double_fault_handler(
+    stack_frame: InterruptStackFrame,
+    _error_code: u64,
+) -> ! {
+    panic!("EXCEPTION: DOUBLE FAULT\n{:#?}", stack_frame);
+}
+
+---
+
+"/kernel/memory.rs":
+use bootloader::bootinfo::{MemoryMap, MemoryRegionType};
+use x86_64::{
+    PhysAddr, VirtAddr,
+    structures::paging::{FrameAllocator, OffsetPageTable, PageTable, PhysFrame, Size4KiB},
+};
+
+pub unsafe fn init(physical_memory_offset: VirtAddr) -> OffsetPageTable<'static> {
+    unsafe {
+        let level_4_table = active_level_4_table(physical_memory_offset);
+        OffsetPageTable::new(level_4_table, physical_memory_offset)
+    }
+}
+
+unsafe fn active_level_4_table(physical_memory_offset: VirtAddr) -> &'static mut PageTable {
+    use x86_64::registers::control::Cr3;
+
+    let (level_4_table_frame, _) = Cr3::read();
+
+    let phys = level_4_table_frame.start_address();
+    let virt = physical_memory_offset + phys.as_u64();
+    let page_table_ptr: *mut PageTable = virt.as_mut_ptr();
+
+    unsafe { &mut *page_table_ptr }
+}
+
+pub struct EmptyFrameAllocator;
+
+unsafe impl FrameAllocator<Size4KiB> for EmptyFrameAllocator {
+    fn allocate_frame(&mut self) -> Option<PhysFrame> {
+        None
+    }
+}
+
+pub struct BootInfoFrameAllocator {
+    memory_map: &'static MemoryMap,
+    next: usize,
+}
+
+impl BootInfoFrameAllocator {
+    pub unsafe fn init(memory_map: &'static MemoryMap) -> Self {
+        BootInfoFrameAllocator {
+            memory_map,
+            next: 0,
+        }
+    }
+
+    fn usable_frames(&self) -> impl Iterator<Item = PhysFrame> {
+        let regions = self.memory_map.iter();
+        let usable_regions = regions.filter(|r| r.region_type == MemoryRegionType::Usable);
+        let addr_ranges = usable_regions.map(|r| r.range.start_addr()..r.range.end_addr());
+        let frame_addresses = addr_ranges.flat_map(|r| r.step_by(4096));
+        frame_addresses.map(|addr| PhysFrame::containing_address(PhysAddr::new(addr)))
+    }
+}
+
+unsafe impl FrameAllocator<Size4KiB> for BootInfoFrameAllocator {
+    fn allocate_frame(&mut self) -> Option<PhysFrame> {
+        let frame = self.usable_frames().nth(self.next);
+        self.next += 1;
+        frame
+    }
+}
+
+---
+
+"/kernel/vga_buffer.rs":
+use core::fmt;
+use spin::Mutex;
+
+lazy_static::lazy_static! {
+        pub static ref WRITER: Mutex<Writer> = Mutex::new(Writer {
+            column_position: 0,
+            color_code: 0x0F,
+            buffer: unsafe { &mut *(0xb8000 as *mut Buffer) },
+        });
+    }
+
+const BUFFER_HEIGHT: usize = 25;
+const BUFFER_WIDTH: usize = 80;
+
+type ColorCode = u8;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ScreenChar {
+    ascii_character: u8,
+    color_code: ColorCode,
+}
+
+#[repr(transparent)]
+struct Buffer {
+    chars: [[ScreenChar; BUFFER_WIDTH]; BUFFER_HEIGHT],
+}
+
+pub struct Writer {
+    column_position: usize,
+    color_code: ColorCode,
+    buffer: &'static mut Buffer,
+}
+
+impl Writer {
+    pub fn write_byte(&mut self, byte: u8) {
+        if self.column_position >= BUFFER_WIDTH {
+            self.new_line();
+        }
+
+        let row = BUFFER_HEIGHT - 1;
+        let col = self.column_position;
+        self.buffer.chars[row][col].ascii_character = byte;
+        self.buffer.chars[row][col].color_code = self.color_code;
+        self.column_position += 1;
+    }
+
+    pub fn write_string(&mut self, s: &str) {
+        for byte in s.bytes() {
+            match byte {
+                0x20..=0x7e => self.write_byte(byte),
+                b'\n' => self.new_line(),
+                _ => self.write_byte(0xfe),
+            }
+        }
+    }
+
+    fn new_line(&mut self) {
+        for row in 1..BUFFER_HEIGHT {
+            for col in 0..BUFFER_WIDTH {
+                self.buffer.chars[row - 1][col] = self.buffer.chars[row][col];
+            }
+        }
+
+        for col in 0..BUFFER_WIDTH {
+            self.buffer.chars[BUFFER_HEIGHT - 1][col] = ScreenChar {
+                ascii_character: b' ',
+                color_code: self.color_code,
+            };
+        }
+
+        self.column_position = 0;
+    }
+}
+
+impl fmt::Write for Writer {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        self.write_string(s);
+        Ok(())
+    }
+}
+
+#[doc(hidden)]
+pub fn _print(args: fmt::Arguments) {
+    use core::fmt::Write;
+    WRITER.lock().write_fmt(args).unwrap();
+}
+
+---
+
+"/task/mod.rs":
+use alloc::boxed::Box;
+use core::{
+    future::Future,
+    pin::Pin,
+    task::{Context, Poll},
+};
+
+pub mod executor;
+pub mod yield_now;
+pub use yield_now::yield_now;
+
+pub struct Task {
+    future: Pin<Box<dyn Future<Output = ()>>>,
+}
+
+impl Task {
+    pub fn new(future: impl Future<Output = ()> + 'static) -> Task {
+        Task {
+            future: Box::pin(future),
+        }
+    }
+
+    fn poll(&mut self, context: &mut Context) -> Poll<()> {
+        self.future.as_mut().poll(context)
+    }
+}
+
+---
+
+"/task/executor.rs":
+use super::Task;
+use alloc::collections::VecDeque;
+use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+use x86_64::instructions::hlt;
+
+pub struct Executor {
+    task_queue: VecDeque<Task>,
+}
+
+impl Executor {
+    pub fn new() -> Executor {
+        Executor {
+            task_queue: VecDeque::new(),
+        }
+    }
+
+    pub fn spawn(&mut self, task: Task) {
+        self.task_queue.push_back(task)
+    }
+
+    pub fn run(&mut self) -> ! {
+        loop {
+            if self.task_queue.is_empty() {
+                hlt();
+            }
+
+            while let Some(mut task) = self.task_queue.pop_front() {
+                let waker = dummy_waker();
+                let mut context = Context::from_waker(&waker);
+                match task.poll(&mut context) {
+                    Poll::Ready(()) => {}
+                    Poll::Pending => self.task_queue.push_back(task),
+                }
+            }
+        }
+    }
+}
+
+fn dummy_raw_waker() -> RawWaker {
+    fn no_op(_: *const ()) {}
+    fn clone(_: *const ()) -> RawWaker {
+        dummy_raw_waker()
+    }
+
+    let vtable = &RawWakerVTable::new(clone, no_op, no_op, no_op);
+    RawWaker::new(0 as *const (), vtable)
+}
+
+fn dummy_waker() -> Waker {
+    unsafe { Waker::from_raw(dummy_raw_waker()) }
+}
+
+---
+
+"/task/yield_now":
+
+use core::future::Future;
+use core::pin::Pin;
+use core::task::{Context, Poll};
+
+pub async fn yield_now() {
+    struct YieldNowFuture {
+        yielded: bool,
+    }
+
+    impl Future for YieldNowFuture {
+        type Output = ();
+
+        fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+            if self.yielded {
+                Poll::Ready(())
+            } else {
+                self.yielded = true;
+                Poll::Pending
+            }
+        }
+    }
+
+    YieldNowFuture { yielded: false }.await;
+}

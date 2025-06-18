@@ -1,0 +1,7 @@
+cargo:rerun-if-changed=C:\Users\deylon\Desktop\Новая папка\llllollll\Cargo.toml
+cargo:rustc-link-search=native=C:\Users\deylon\Desktop\Новая папка\llllollll\target\bootimage\bootloader\x86_64-bootloader\release\build\bootloader-a065b1faec336395\out
+cargo:rustc-link-lib=static=kernel_bin-deylon666
+cargo:rerun-if-env-changed=KERNEL
+cargo:rerun-if-env-changed=KERNEL_MANIFEST
+cargo:rerun-if-changed=\\?\C:\Users\deylon\Desktop\Новая папка\llllollll\target\x86_64\debug\deylon666
+cargo:rerun-if-changed=build.rs
